@@ -11,6 +11,8 @@ if PROJECT_ROOT not in sys.path:
 from streamv2v.inference_pipe import InferencePipelineManager, compute_default_block_distribution
 from util import clear_queue, get_num_transformer_blocks, read_images_from_queue, resolve_worker_device
 
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 
@@ -65,6 +67,21 @@ class MultiGPUPipeline(Pipeline):
         )
 
 
+def _runtime_flags_locked() -> bool:
+    return os.environ.get("STREAMV2V_LOCK_RUNTIME_FLAGS", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_requested_runtime_flag(runtime_state, key: str, current: bool) -> bool:
+    """Resolve frontend-requested toggle for use_taehv/use_tensorrt.
+
+    When STREAMV2V_LOCK_RUNTIME_FLAGS is enabled, we always pin to the
+    current (launch-time) value so the worker never enters the rebuild path.
+    """
+    if _runtime_flags_locked():
+        return current
+    return bool(runtime_state.get(key, current))
+
+
 def _rebuild_pipeline_for_runtime_options(
     args,
     device,
@@ -74,6 +91,22 @@ def _rebuild_pipeline_for_runtime_options(
     requested_use_taehv: bool,
     requested_use_tensorrt: bool,
 ):
+    # When STREAMV2V_LOCK_RUNTIME_FLAGS=1, ignore frontend toggle of
+    # use_taehv/use_tensorrt to avoid rebuilding the (very large) 14B FSDP
+    # pipeline at runtime — rebuilds for 14B can OOM because old FSDP shards
+    # are not always released cleanly before the new pipeline is allocated.
+    # In that mode we keep the launch-time setting and just return the existing
+    # manager so worker loops never re-enter the rebuild path.
+    if os.environ.get("STREAMV2V_LOCK_RUNTIME_FLAGS", "").lower() in {"1", "true", "yes", "on"}:
+        if current_manager is not None:
+            current_manager.logger.info(
+                "[LOCK_RUNTIME_FLAGS] Ignoring rebuild request on rank %s "
+                "(requested use_taehv=%s, use_tensorrt=%s); keeping launch-time settings.",
+                rank,
+                requested_use_taehv,
+                requested_use_tensorrt,
+            )
+        return current_manager
     if current_manager is not None:
         current_manager.logger.info(
             "Rebuilding demo rank %s for use_taehv=%s, use_tensorrt=%s",
@@ -113,8 +146,8 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
         prepare_event.set()
 
         while not stop_event.is_set():
-            requested_use_taehv = bool(runtime_state.get("use_taehv", current_use_taehv))
-            requested_use_tensorrt = bool(runtime_state.get("use_tensorrt", current_use_tensorrt))
+            requested_use_taehv = _resolve_requested_runtime_flag(runtime_state, "use_taehv", current_use_taehv)
+            requested_use_tensorrt = _resolve_requested_runtime_flag(runtime_state, "use_tensorrt", current_use_tensorrt)
             if requested_use_taehv != current_use_taehv or requested_use_tensorrt != current_use_tensorrt:
                 if is_running and "session" in locals() and "denoised_pred" in locals() and "patched_x_shape" in locals():
                     pipeline_manager.send_demo_input_prompt_update(
@@ -165,8 +198,20 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 outstanding = []
 
             if not is_running:
-                images = read_images_from_queue(input_queue, first_batch_num_frames, device, stop_event)
+                # First batch: downstream ranks are blocked on
+                # _receive_initial_noise / dist.barrier waiting for rank 0
+                # to send the very first collective. rank 0 cannot send
+                # until the first frame arrives from a real client. We
+                # therefore wait indefinitely for a client here (only
+                # stop_event can break us out). The large NCCL timeout set
+                # in init_dist_tcp (30 min default) gives this plenty of
+                # headroom before the process group self-aborts.
+                images = read_images_from_queue(
+                    input_queue, first_batch_num_frames, device, stop_event,
+                    idle_timeout_sec=None,
+                )
                 if images is None:
+                    # stop_event was set => graceful shutdown.
                     return
                 pipeline_manager.logger.info(f"Initializing rank {rank} first batch")
                 session = pipeline_manager.start_demo_input_stream_session(
@@ -185,9 +230,54 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 start_vae = time.time()
 
             if session.input_batch == 0:
-                images = read_images_from_queue(input_queue, chunk_size, device, stop_event)
+                # Mid-session read: bound the wait so that if the client
+                # disconnects we escape BEFORE NCCL watchdog fires on the
+                # downstream ranks (which are blocked in recv_latent_data).
+                # Default 15s is well under the 60s NCCL timeout we set
+                # in init_dist_tcp.
+                images = read_images_from_queue(
+                    input_queue, chunk_size, device, stop_event,
+                    idle_timeout_sec=float(os.environ.get("STREAMV2V_CHUNK_IDLE_SEC", "15")),
+                )
                 if images is None:
-                    break
+                    # CRITICAL: rank 0's input queue went idle mid-stream
+                    # (WebSocket disconnect / pipeline.close()). The other
+                    # ranks are blocked in receive_latent_data_async on the
+                    # next chunk. If we simply `break`, they deadlock for
+                    # the full NCCL timeout. Send a prompt-restart pill
+                    # (chunk_idx=-1) so rank 1/2/3 fall out of the current
+                    # session and wait for a fresh prompt on recv_prompt_async.
+                    # This uses the existing, tested "prompt update" path.
+                    pipeline_manager.logger.info(
+                        "rank 0 input went idle mid-stream; sending chunk_idx=-1 "
+                        "sentinel to unblock downstream ranks (session end)."
+                    )
+                    try:
+                        if "denoised_pred" in locals() and "patched_x_shape" in locals():
+                            pipeline_manager.send_demo_input_prompt_update(
+                                prompt=runtime_state["prompt"],
+                                device=device,
+                                num_steps=num_steps,
+                                chunk_idx=session.chunk_idx,
+                                denoised_pred=denoised_pred,
+                                patched_x_shape=patched_x_shape,
+                                current_step=session.current_step,
+                            )
+                    except Exception as sentinel_exc:  # noqa: BLE001
+                        pipeline_manager.logger.warning(
+                            "Failed to send end-of-session sentinel to downstream "
+                            "ranks (they may deadlock until NCCL timeout): %s",
+                            sentinel_exc,
+                        )
+                    # After the sentinel, reset local state so the next user
+                    # session starts cleanly without retrying NCCL ops that
+                    # the downstream ranks will no longer answer on this
+                    # sequence number.
+                    is_running = False
+                    outstanding = []
+                    if stop_event.is_set():
+                        return
+                    continue
                 pipeline_manager.prepare_demo_input_batch(session, images)
 
             if schedule_block:
@@ -272,8 +362,8 @@ def output_process(rank, block_num, total_blocks, args, runtime_state, prepare_e
                 need_update_prompt = False
                 outstanding = []
 
-            requested_use_taehv = bool(runtime_state.get("use_taehv", current_use_taehv))
-            requested_use_tensorrt = bool(runtime_state.get("use_tensorrt", current_use_tensorrt))
+            requested_use_taehv = _resolve_requested_runtime_flag(runtime_state, "use_taehv", current_use_taehv)
+            requested_use_tensorrt = _resolve_requested_runtime_flag(runtime_state, "use_tensorrt", current_use_tensorrt)
             if requested_use_taehv != current_use_taehv or requested_use_tensorrt != current_use_tensorrt:
                 current_use_taehv = requested_use_taehv
                 current_use_tensorrt = requested_use_tensorrt
@@ -391,8 +481,8 @@ def middle_process(rank, block_num, total_blocks, args, runtime_state, prepare_e
                 need_update_prompt = False
                 outstanding = []
 
-            requested_use_taehv = bool(runtime_state.get("use_taehv", current_use_taehv))
-            requested_use_tensorrt = bool(runtime_state.get("use_tensorrt", current_use_tensorrt))
+            requested_use_taehv = _resolve_requested_runtime_flag(runtime_state, "use_taehv", current_use_taehv)
+            requested_use_tensorrt = _resolve_requested_runtime_flag(runtime_state, "use_tensorrt", current_use_tensorrt)
             if requested_use_taehv != current_use_taehv or requested_use_tensorrt != current_use_tensorrt:
                 current_use_taehv = requested_use_taehv
                 current_use_tensorrt = requested_use_tensorrt
@@ -463,12 +553,34 @@ def middle_process(rank, block_num, total_blocks, args, runtime_state, prepare_e
 
 
 def init_dist_tcp(rank: int, world_size: int, master_addr: str = "127.0.0.1", master_port: int = 29500, device: torch.device = None):
+    # Allow overriding the master port via env so multiple demo services can
+    # coexist on the same host (e.g. 14B on :7862 and 1.3B on :7863 each need
+    # their own torch.distributed rendezvous port).
+    master_port = int(os.environ.get("STREAMV2V_MASTER_PORT", master_port))
+    master_addr = os.environ.get("STREAMV2V_MASTER_ADDR", master_addr)
+    # NCCL collective-op timeout. PyTorch's default is 10 minutes. We keep
+    # it LONG here (30 min by default) because the downstream ranks block on
+    # `_receive_initial_noise` / `dist.barrier` during first-batch setup
+    # waiting for rank 0 to encode the first frame — which itself waits for
+    # a real client to connect and push frames. If this timeout is shorter
+    # than the "time to first client", the demo deadlocks even on a cold
+    # start with no bugs.
+    #
+    # Mid-session deadlocks (client disconnects while rank 1/2/3 wait for
+    # the next NCCL send from rank 0) are handled at a HIGHER layer by the
+    # STREAMV2V_CHUNK_IDLE_SEC path in input_process(), which sends a
+    # chunk_idx=-1 sentinel to unblock downstream ranks within ~15s — long
+    # before NCCL would time out anyway.
+    #
+    # Env override: STREAMV2V_NCCL_TIMEOUT_SEC (seconds; default 1800).
+    timeout_sec = int(os.environ.get("STREAMV2V_NCCL_TIMEOUT_SEC", "1800"))
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://{master_addr}:{master_port}",
         rank=rank,
         world_size=world_size,
         device_id=device,
+        timeout=timedelta(seconds=timeout_sec),
     )
 
 

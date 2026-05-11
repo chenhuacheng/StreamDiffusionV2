@@ -317,7 +317,15 @@ def generate_process(args, runtime_state, prepare_event, restart_event, stop_eve
                 if restart_event.is_set():
                     clear_queue(input_queue)
                     restart_event.clear()
-                images = read_images_from_queue(input_queue, first_batch_num_frames, device, stop_event)
+                # First batch: no NCCL ranks to unblock (single-GPU). Wait
+                # indefinitely for a client; only stop_event breaks us out.
+                images = read_images_from_queue(
+                    input_queue, first_batch_num_frames, device, stop_event,
+                    idle_timeout_sec=None,
+                )
+                if images is None:
+                    # stop_event => graceful shutdown
+                    break
 
                 session, initial_video = pipeline_manager.start_stream_session(
                     prompt=prompt,
@@ -328,9 +336,18 @@ def generate_process(args, runtime_state, prepare_event, restart_event, stop_eve
                     output_queue.put(image)
                 is_running = True
 
-            images = read_images_from_queue(input_queue, chunk_size, device, stop_event)
+            images = read_images_from_queue(
+                input_queue, chunk_size, device, stop_event,
+                idle_timeout_sec=float(os.environ.get("STREAMV2V_CHUNK_IDLE_SEC", "15")),
+            )
             if images is None:
-                break
+                if stop_event.is_set():
+                    break
+                # Client went idle mid-stream on single-GPU path. No NCCL
+                # ranks to unblock here; just reset the session so the next
+                # client starts fresh.
+                is_running = False
+                continue
 
             for decoded_video in pipeline_manager.run_stream_batch(session, images):
                 for image in decoded_video:

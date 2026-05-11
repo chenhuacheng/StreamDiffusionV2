@@ -42,10 +42,30 @@ def is_firefox(user_agent: str) -> bool:
     return "Firefox" in user_agent
 
 
-def read_images_from_queue(queue, num_frames_needed, device, stop_event=None):
+def read_images_from_queue(queue, num_frames_needed, device, stop_event=None, idle_timeout_sec=None):
+    """Wait until `num_frames_needed` frames are available in `queue`, then drain and stack.
+
+    Returns None if:
+      - `stop_event` is set (graceful shutdown), OR
+      - `idle_timeout_sec` is not None and no new frames arrived for that long
+        (the client likely disconnected mid-stream). Returning None instead of
+        spinning forever lets rank 0 send a session-end sentinel to the
+        downstream ranks so they do not deadlock on NCCL recv.
+
+    `idle_timeout_sec` measures *idle time* (no queue growth), not total wait,
+    so slow-frame-rate clients are not falsely terminated.
+    """
+    last_size = queue.qsize()
+    last_progress = time.time()
     # Wait until we have enough frames
     while queue.qsize() < num_frames_needed:
         if stop_event and stop_event.is_set():
+            return None
+        cur_size = queue.qsize()
+        if cur_size != last_size:
+            last_size = cur_size
+            last_progress = time.time()
+        elif idle_timeout_sec is not None and (time.time() - last_progress) > idle_timeout_sec:
             return None
         time.sleep(0.01)
 
