@@ -186,6 +186,148 @@ def tail_log(path, n=80):
         return []
 
 
+# ------------------------ Throughput from log ------------------------
+# Format we parse:
+# 2026-05-11 20:36:13,032 - INFO - [Metrics] Batch 382/1000: current_frames=4,
+#    avg_latency=4.4208s, remaining=58, data_count=1524
+#
+# Semantics (verified against demo/main.py):
+#   data_count : monotonic counter of *input* frames received from clients
+#                (resets when worker restarts / batch_num rotates back to 1)
+#   batch_num  : monotonic batch id, resets every 1000 (=> rotate)
+#   remaining  : current queue length (pending input frames not yet consumed)
+#   current_frames : frames packed into this batch
+#
+# From this we derive (rolling window over recent samples):
+#   input  fps = Δdata_count / Δt        (real client push rate)
+#   output fps = Δbatch_num * cf / Δt    (real worker drain rate)
+#   queue      = latest `remaining`, plus its growth/s in window
+_METRICS_RE = re.compile(
+    r'^(\S+ \S+).*\[Metrics\] Batch (\d+)/\d+: '
+    r'current_frames=(\d+), avg_latency=([\d.]+)s, '
+    r'remaining=(\d+), data_count=(\d+)'
+)
+
+
+def parse_metrics_tail(path, max_lines=400):
+    """Parse the last N [Metrics] lines from the log.
+
+    Returns list of dicts (oldest first):
+        {ts: float epoch, batch: int, cf: int, avg_lat_s: float,
+         remaining: int, data_count: int}
+
+    Cheap: we just `grep ... | tail -N` so we don't read the whole log.
+    """
+    if not path or not os.path.exists(path):
+        return []
+    # grep is much faster than reading the whole file in python
+    out, rc = sh(
+        f"grep -F '[Metrics] Batch' {path!r} | tail -n {max_lines}"
+    )
+    if rc != 0 or not out:
+        return []
+    rows = []
+    for line in out.splitlines():
+        m = _METRICS_RE.search(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f").timestamp()
+        except Exception:
+            continue
+        rows.append({
+            "ts": ts,
+            "batch": int(m.group(2)),
+            "cf": int(m.group(3)),
+            "avg_lat_s": float(m.group(4)),
+            "remaining": int(m.group(5)),
+            "data_count": int(m.group(6)),
+        })
+    return rows
+
+
+def compute_throughput(rows, window_s=30.0):
+    """Compute live input/output FPS + queue stats from recent metrics rows.
+
+    Window: last `window_s` seconds of samples (or all rows if fewer).
+    Robust to:
+      - batch_num rotating back to 1 (every 1000 batches): we segment.
+      - data_count resetting on worker restart: same.
+    Returns dict (None values if not enough data):
+        input_fps, output_fps, queue, queue_growth_per_s,
+        per_frame_ms, samples, window_s, last_ts
+    """
+    blank = {
+        "input_fps": None, "output_fps": None,
+        "queue": None, "queue_growth_per_s": None,
+        "per_frame_ms": None, "samples": 0,
+        "window_s": window_s, "last_ts": None,
+        "stale_s": None, "cf": None,
+    }
+    if not rows:
+        return blank
+
+    last_ts = rows[-1]["ts"]
+    cutoff = last_ts - window_s
+    win = [r for r in rows if r["ts"] >= cutoff]
+    if len(win) < 2:
+        # fall back: just report queue from the very last line
+        blank.update({
+            "queue": rows[-1]["remaining"],
+            "cf": rows[-1]["cf"],
+            "samples": 1,
+            "last_ts": last_ts,
+            "stale_s": max(0.0, time.time() - last_ts),
+        })
+        return blank
+
+    # Drop counter resets inside window (keep only the latest contiguous run).
+    # A reset is when batch number or data_count goes *backwards*.
+    start = 0
+    for i in range(1, len(win)):
+        if win[i]["batch"] < win[i-1]["batch"] or win[i]["data_count"] < win[i-1]["data_count"]:
+            start = i
+    win = win[start:]
+    if len(win) < 2:
+        blank.update({
+            "queue": rows[-1]["remaining"],
+            "cf": rows[-1]["cf"],
+            "samples": 1,
+            "last_ts": last_ts,
+            "stale_s": max(0.0, time.time() - last_ts),
+        })
+        return blank
+
+    t0 = win[0]["ts"]; t1 = win[-1]["ts"]
+    dt = t1 - t0
+    if dt <= 0:
+        return blank
+    cf_counts = {}
+    for r in win:
+        cf_counts[r["cf"]] = cf_counts.get(r["cf"], 0) + 1
+    cf_mode = max(cf_counts, key=cf_counts.get)
+    n_batches = win[-1]["batch"] - win[0]["batch"]
+    n_frames_in = win[-1]["data_count"] - win[0]["data_count"]
+    n_frames_out = n_batches * cf_mode
+    input_fps = n_frames_in / dt if dt > 0 else None
+    output_fps = n_frames_out / dt if dt > 0 else None
+    queue_growth = (win[-1]["remaining"] - win[0]["remaining"]) / dt
+    per_frame_ms = (dt / n_frames_out * 1000.0) if n_frames_out > 0 else None
+
+    return {
+        "input_fps": round(input_fps, 2) if input_fps is not None else None,
+        "output_fps": round(output_fps, 2) if output_fps is not None else None,
+        "queue": rows[-1]["remaining"],
+        "queue_growth_per_s": round(queue_growth, 2),
+        "per_frame_ms": round(per_frame_ms, 1) if per_frame_ms is not None else None,
+        "samples": len(win),
+        "window_s": round(dt, 1),
+        "last_ts": last_ts,
+        "stale_s": round(max(0.0, time.time() - last_ts), 1),
+        "cf": cf_mode,
+    }
+
+
 def scan_log_health(path, max_bytes=1_000_000):
     """看日志最后 1MB 的关键错误数 / restart 事件"""
     if not path or not os.path.exists(path):
@@ -261,6 +403,10 @@ def take_snapshot():
     #   * 200 + enabled=false   -> metrics disabled (surface a friendly msg)
     #   * anything else         -> surface the transport error
     snap["metrics"] = collect_metrics(ARGS.demo_port)
+    # Live throughput (input/output FPS + queue) parsed from the demo log.
+    # Cheap: grep tail of the file. Window default 30s.
+    metric_rows = parse_metrics_tail(ARGS.log, max_lines=400)
+    snap["throughput"] = compute_throughput(metric_rows, window_s=ARGS.throughput_window_s)
     snap["log"] = scan_log_health(ARGS.log)
     snap["status"], snap["status_reason"] = overall_status(snap)
     snap["monitor_uptime_s"] = int(time.time() - START_TS)
@@ -276,6 +422,7 @@ def sampler_loop():
             m = snap.get("metrics") or {}
             e2e = m.get("e2e") or {}
             ttff = m.get("ttff") or {}
+            tp = snap.get("throughput") or {}
             HISTORY.append({
                 "ts": snap["ts"],
                 "status": snap["status"],
@@ -290,6 +437,10 @@ def sampler_loop():
                 "e2e_p95_ms": e2e.get("p95_ms"),
                 "e2e_p99_ms": e2e.get("p99_ms"),
                 "ttff_last_ms": ttff.get("last_ms"),
+                # live throughput (parsed from demo log)
+                "input_fps":  tp.get("input_fps"),
+                "output_fps": tp.get("output_fps"),
+                "queue":      tp.get("queue"),
             })
             cur_attempts = snap["log"]["restart_attempts"]
             if cur_attempts > last_attempts:
@@ -345,6 +496,7 @@ a{color:#58a6ff;text-decoration:none}
   <div class="card"><h2>summary</h2><div id="summary"></div></div>
   <div class="card"><h2>ports & api</h2><div id="ports"></div></div>
   <div class="card"><h2>log health</h2><div id="loghealth"></div></div>
+  <div class="card"><h2>live throughput</h2><div id="throughput"></div></div>
 </div>
 
 <h2>latency</h2>
@@ -406,6 +558,9 @@ async function refresh(){
     kv('RuntimeError',e.RuntimeError, e.RuntimeError?'warn':'ok')+
     kv('OOM',e.OOM, e.OOM?'bad':'ok');
 
+  // live throughput (input fps / output fps / queue) — parsed from demo log
+  renderThroughput(s.throughput||{});
+
   // latency: first-frame + e2e histogram
   renderLatency(s.metrics||{status:'error',reason:'no metrics payload'});
 
@@ -446,6 +601,42 @@ async function refresh(){
   pre.scrollTop=pre.scrollHeight;
 }
 function kv(k,v,cls){return `<div class="kv"><span>${k}</span><span class="${cls||''}">${v}</span></div>`}
+
+function renderThroughput(t){
+  const el=document.getElementById('throughput');
+  if(!t || (t.input_fps===null && t.output_fps===null && t.queue===null)){
+    el.innerHTML='<small>no [Metrics] log lines yet (waiting for first batch)</small>';
+    return;
+  }
+  // Color hints:
+  //   queue:        >50 bad, >20 warn
+  //   queue growth: >+0.3/s bad (堆积), >+0.05 warn
+  //   input vs output: input>output+0.3 -> warn (worker 跟不上)
+  const q   = t.queue;
+  const qg  = t.queue_growth_per_s;
+  const inF = t.input_fps;
+  const ouF = t.output_fps;
+  const pf  = t.per_frame_ms;
+  const stale = t.stale_s;
+
+  const qCls  = (q===null) ? '' : (q>50?'bad':(q>20?'warn':'ok'));
+  const qgCls = (qg===null)? '' : (qg>0.3?'bad':(qg>0.05?'warn':(qg<-0.05?'ok':'')));
+  let inCls='', ouCls='';
+  if(inF!==null && ouF!==null){
+    if(inF > ouF + 0.3) { inCls='warn'; ouCls='warn'; }   // 输入快于输出 → 队列要堆
+    else if (Math.abs(inF-ouF)<=0.3) { inCls='ok'; ouCls='ok'; }
+  }
+  const staleCls = (stale!==null && stale>15) ? 'warn' : '';
+
+  el.innerHTML=
+    kv('input fps (client push)',  inF===null?'-':inF.toFixed(2)+' fps', inCls)+
+    kv('output fps (worker drain)',ouF===null?'-':ouF.toFixed(2)+' fps', ouCls)+
+    kv('per-frame proc',           pf===null?'-':pf.toFixed(1)+' ms')+
+    kv('queue (pending)',          q===null?'-':q+' frames', qCls)+
+    kv('queue growth',             qg===null?'-':(qg>0?'+':'')+qg.toFixed(2)+' /s', qgCls)+
+    kv('window',                   `${t.window_s||0}s · ${t.samples||0} samples` + (t.cf?` · cf=${t.cf}`:''))+
+    kv('last log age',             stale===null?'-':stale.toFixed(0)+' s ago', staleCls);
+}
 
 function fmtMs(x){
   if(x===undefined||x===null) return '-';
@@ -593,6 +784,8 @@ def main():
     ap.add_argument("--gpus", default="4,5,6,7", help="comma list of gpu indices")
     ap.add_argument("--log", default="/root/StreamDiffusionV2/repo/outputs/demo_1p3b_4gpu.log")
     ap.add_argument("--interval", type=int, default=5)
+    ap.add_argument("--throughput-window-s", type=float, default=30.0,
+                    help="rolling window (seconds) for input/output FPS estimation")
     ARGS = ap.parse_args()
     ARGS.gpu_ids_set = set(int(x) for x in ARGS.gpus.split(",") if x.strip())
 
