@@ -53,6 +53,15 @@ class App:
             self.user_batch_count = {}  # user_id -> count of batches collected
             self.user_latency_history = {}  # user_id -> list of latencies for statistics
             self.user_raw_data = {}  # user_id -> list of raw batch data (for logging)
+            # First-frame latency tracking: for each user, remember the
+            # timestamp when their *first* input frame entered the pipeline
+            # queue (push_frames_to_pipeline).  When the matching output
+            # frame is produced we emit a single TTFF ("time-to-first-
+            # frame") sample per session.  This is stored globally (across
+            # sessions) so the monitor can aggregate.
+            self.user_first_input_ts = {}   # user_id -> float | None
+            self.user_ttff_emitted = set()  # user_ids for which we already emitted TTFF
+            self.first_frame_latencies = deque(maxlen=500)  # global ring of TTFF samples (seconds)
             self.metrics_log_dir = "./slo_metrics"
             os.makedirs(self.metrics_log_dir, exist_ok=True)
         self.init_app()
@@ -76,9 +85,31 @@ class App:
             except ServerFullException as e:
                 logging.error(f"Server Full: {e}")
             finally:
-                await self._stop_prediction_worker(user_id)
-                # Do not block shutdown here; schedule disconnect
-                asyncio.create_task(self.conn_manager.disconnect(user_id, self.pipeline))
+                # Order matters:
+                # 1) stop the prediction worker thread so it no longer drains
+                #    pipeline output concurrently with our cleanup.
+                # 2) THEN disconnect + signal pipeline end. We await this
+                #    rather than fire-and-forget so that the
+                #    input_queue-drain + restart_event.set path actually
+                #    runs before the next client's handler touches the
+                #    pipeline (avoids overlapping sessions racing on the
+                #    shared GPU process group).
+                try:
+                    await self._stop_prediction_worker(user_id)
+                except Exception as e:  # noqa: BLE001
+                    logging.error(f"Error stopping prediction worker for {user_id}: {e}")
+                try:
+                    await asyncio.wait_for(
+                        self.conn_manager.disconnect(user_id, self.pipeline),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "disconnect() for %s exceeded 5s; continuing cleanup.",
+                        user_id,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logging.error(f"Error during disconnect for {user_id}: {e}")
                 # Clean up metrics and timestamp tracking for this user
                 if self.enable_metrics:
                     with self.user_metrics_lock:
@@ -86,6 +117,8 @@ class App:
                         self.user_batch_count.pop(user_id, None)
                         self.user_latency_history.pop(user_id, None)
                         self.user_raw_data.pop(user_id, None)
+                        self.user_first_input_ts.pop(user_id, None)
+                        self.user_ttff_emitted.discard(user_id)
                 logging.info(f"User disconnected: {user_id}")
 
         async def handle_websocket_data(user_id: uuid.UUID):
@@ -193,7 +226,143 @@ class App:
         async def get_queue_size():
             queue_size = self.conn_manager.get_user_count()
             return JSONResponse({"queue_size": queue_size})
-        
+
+        # Histogram bin edges (ms) for end-to-end latency distribution.
+        # Chosen to give useful resolution across the full range we care
+        # about in a realtime video pipeline (sub-100ms "great" -> multi-
+        # second "bad"). Keep these in sync with any frontend/monitor
+        # consumer.
+        E2E_HIST_BINS_MS = (
+            0, 50, 100, 150, 200, 300, 500, 800,
+            1200, 2000, 3000, 5000, 10000,
+        )
+
+        def _percentiles(values, pcts):
+            """Tiny stdlib percentile helper (linear interpolation) so the
+            /api/metrics/summary endpoint does not require numpy in the
+            hot path. `values` must already be a list of floats."""
+            if not values:
+                return {f"p{p}": 0.0 for p in pcts}
+            s = sorted(values)
+            n = len(s)
+            out = {}
+            for p in pcts:
+                if n == 1:
+                    out[f"p{p}"] = s[0]
+                    continue
+                k = (p / 100.0) * (n - 1)
+                lo = int(k)
+                hi = min(lo + 1, n - 1)
+                frac = k - lo
+                out[f"p{p}"] = s[lo] * (1 - frac) + s[hi] * frac
+            return out
+
+        def _histogram_ms(values_sec, bin_edges_ms):
+            """Bucket latencies (seconds) into fixed ms bins. Last bucket
+            catches everything >= last edge (the '+inf' tail)."""
+            counts = [0] * len(bin_edges_ms)  # len(edges) buckets: [e0,e1) ... [e_{n-1}, +inf)
+            for v in values_sec:
+                v_ms = v * 1000.0
+                placed = False
+                for i in range(len(bin_edges_ms) - 1):
+                    if bin_edges_ms[i] <= v_ms < bin_edges_ms[i + 1]:
+                        counts[i] += 1
+                        placed = True
+                        break
+                if not placed:
+                    # v_ms >= last edge, goes into the overflow bucket
+                    counts[-1] += 1
+            return counts
+
+        # NOTE: /api/metrics/summary MUST be registered before
+        # /api/metrics/{user_id}; otherwise FastAPI matches "summary" as a
+        # user_id and rejects the request with HTTP 422 ("invalid UUID").
+        @self.app.get("/api/metrics/summary")
+        async def get_metrics_summary(window_size: int = 500):
+            """Aggregate metrics across all active users for the demo
+            monitor. Returns end-to-end latency stats + a fixed-bin
+            histogram + first-frame (TTFF) stats. When metrics collection
+            is disabled, returns `enabled=false` so the monitor can show
+            a clear reason rather than treat it as an outage.
+            """
+            if not self.enable_metrics:
+                return JSONResponse({
+                    "enabled": False,
+                    "reason": "start demo with --enable-metrics to populate",
+                })
+            try:
+                with self.user_metrics_lock:
+                    # Flatten the last `window_size` latencies per user, then
+                    # globally clip again, so a single very chatty user does
+                    # not drown out everyone else.
+                    all_latencies = []
+                    per_user = {}
+                    for uid, hist in self.user_latency_history.items():
+                        tail = list(hist[-window_size:])
+                        per_user[str(uid)] = len(tail)
+                        all_latencies.extend(tail)
+                    all_latencies = all_latencies[-window_size * max(1, len(per_user)):]
+                    ttff_samples = list(self.first_frame_latencies)
+                    active_users = len(per_user)
+                    pending_inputs = {
+                        str(uid): len(q) for uid, q in self.user_input_timestamps.items()
+                    }
+
+                pcts = (50, 90, 95, 99)
+                e2e_stats = {}
+                if all_latencies:
+                    e2e_stats = {
+                        "count": len(all_latencies),
+                        "mean_ms": (sum(all_latencies) / len(all_latencies)) * 1000.0,
+                        "min_ms": min(all_latencies) * 1000.0,
+                        "max_ms": max(all_latencies) * 1000.0,
+                    }
+                    e2e_stats.update({
+                        f"{k}_ms": v * 1000.0
+                        for k, v in _percentiles(all_latencies, pcts).items()
+                    })
+                    # Deadline miss rate against configured target
+                    deadline = self.target_latency
+                    missed = sum(1 for v in all_latencies if v > deadline)
+                    e2e_stats["deadline_s"] = deadline
+                    e2e_stats["deadline_miss_rate"] = missed / len(all_latencies)
+                else:
+                    e2e_stats = {"count": 0}
+
+                ttff_stats = {"count": len(ttff_samples)}
+                if ttff_samples:
+                    ttff_stats.update({
+                        "mean_ms": (sum(ttff_samples) / len(ttff_samples)) * 1000.0,
+                        "min_ms": min(ttff_samples) * 1000.0,
+                        "max_ms": max(ttff_samples) * 1000.0,
+                        "last_ms": ttff_samples[-1] * 1000.0,
+                    })
+                    ttff_stats.update({
+                        f"{k}_ms": v * 1000.0
+                        for k, v in _percentiles(ttff_samples, pcts).items()
+                    })
+
+                histogram = {
+                    "bin_edges_ms": list(E2E_HIST_BINS_MS),
+                    # len(counts) == len(edges): last bucket is [last_edge, +inf)
+                    "counts": _histogram_ms(all_latencies, E2E_HIST_BINS_MS),
+                    "unit": "ms",
+                }
+
+                return JSONResponse({
+                    "enabled": True,
+                    "window_size": window_size,
+                    "active_users": active_users,
+                    "per_user_sample_count": per_user,
+                    "pending_inputs_per_user": pending_inputs,
+                    "e2e_latency": e2e_stats,
+                    "first_frame_latency": ttff_stats,
+                    "e2e_histogram": histogram,
+                })
+            except Exception as e:
+                logging.error(f"Error getting summary metrics: {e}")
+                return JSONResponse({"error": str(e)}, status_code=500)
+
         @self.app.get("/api/metrics/{user_id}")
         async def get_metrics(user_id: uuid.UUID, window_size: int = 100):
             """Get SLO metrics for a specific user"""
@@ -269,6 +438,9 @@ class App:
                                             if user_id not in self.user_input_timestamps:
                                                 self.user_input_timestamps[user_id] = deque()
                                             self.user_input_timestamps[user_id].append(input_timestamp)
+                                            # Capture first-ever input ts for TTFF
+                                            if user_id not in self.user_first_input_ts:
+                                                self.user_first_input_ts[user_id] = input_timestamp
                                     
                                     last_params = params
                                     self.pipeline.accept_new_params(params)
@@ -292,6 +464,8 @@ class App:
                                         if user_id not in self.user_input_timestamps:
                                             self.user_input_timestamps[user_id] = deque()
                                         self.user_input_timestamps[user_id].append(input_timestamp)
+                                        if user_id not in self.user_first_input_ts:
+                                            self.user_first_input_ts[user_id] = input_timestamp
                                 self.pipeline.accept_new_params(params)
                             await self.conn_manager.send_json(
                                 user_id, {"status": "send_frame"}
@@ -369,11 +543,25 @@ class App:
                                             input_timestamp = self.user_input_timestamps[user_id].popleft()
                                             latency = output_timestamp - input_timestamp
                                             batch_latencies.append(latency)
-                                            
+
                                             # Add to history for statistics
                                             if user_id not in self.user_latency_history:
                                                 self.user_latency_history[user_id] = []
                                             self.user_latency_history[user_id].append(latency)
+
+                                    # Emit TTFF (time-to-first-frame) once per session: the
+                                    # latency between the user's *first* input frame and the
+                                    # *first* output frame we produced for them.
+                                    if (user_id not in self.user_ttff_emitted
+                                            and len(batch_latencies) > 0
+                                            and self.user_first_input_ts.get(user_id) is not None):
+                                        ttff = output_timestamp - self.user_first_input_ts[user_id]
+                                        self.first_frame_latencies.append(ttff)
+                                        self.user_ttff_emitted.add(user_id)
+                                        LOGGER.info(
+                                            "[Metrics] TTFF user=%s first_frame_latency=%.3fs",
+                                            user_id, ttff,
+                                        )
                                     
                                     # Print batch statistics
                                     if len(batch_latencies) > 0:
@@ -462,6 +650,30 @@ class App:
                     "page_content": page_content if info.page_content else "",
                 }
             )
+
+        @self.app.get("/api/variant")
+        async def variant():
+            """Return which model variant this backend is serving and the
+            peer variants available on other ports so the frontend can
+            render a selector and redirect on switch.
+
+            Configured via environment variables:
+              DEMO_CURRENT_VARIANT : id of *this* backend (e.g. "14B" / "1.3B")
+              DEMO_VARIANTS        : JSON list of
+                  [{"id": "14B", "label": "14B", "port": 7862}, ...]
+            """
+            import json as _json
+            current = os.environ.get("DEMO_CURRENT_VARIANT", "")
+            raw = os.environ.get("DEMO_VARIANTS", "")
+            variants = []
+            if raw:
+                try:
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, list):
+                        variants = parsed
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to parse DEMO_VARIANTS env: %s", exc)
+            return JSONResponse({"current": current, "variants": variants})
 
         os.makedirs(self.frontend_public_dir, exist_ok=True)
 

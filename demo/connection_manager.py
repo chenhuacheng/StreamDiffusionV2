@@ -120,6 +120,37 @@ class ConnectionManager:
             except Exception as e:
                 logging.error(f"Error: Exception while clearing data for {user_id}: {e}")
 
+            # IMPORTANT: signal the GPU inference worker(s) that this session
+            # has ended. Without this, rank 0 will keep spinning on an empty
+            # input_queue while rank 1/2/3 block on the next NCCL recv_latent
+            # for up to the full NCCL timeout. Draining input_queue + setting
+            # restart_event uses the existing prompt-restart code path, which
+            # on multi-GPU triggers send_demo_input_prompt_update (chunk_idx=-1)
+            # to cleanly unblock the downstream ranks.
+            if pipeline is not None and self.get_user_count() == 0:
+                try:
+                    input_queue = getattr(pipeline, "input_queue", None)
+                    if input_queue is not None:
+                        # drain non-blocking
+                        while True:
+                            try:
+                                input_queue.get_nowait()
+                            except Exception:  # noqa: BLE001
+                                break
+                    restart_event = getattr(pipeline, "restart_event", None)
+                    if restart_event is not None:
+                        restart_event.set()
+                        self.logger.info(
+                            "Signaled pipeline session end for user %s "
+                            "(input_queue drained, restart_event set).",
+                            user_id,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logging.error(
+                        f"Error: Exception while signaling pipeline session end "
+                        f"for {user_id}: {e}"
+                    )
+
     async def disconnect_all(self, pipeline: Optional["Pipeline"] = None):
         """Disconnect all users and close pipeline"""
         self.logger.info("Disconnecting all %s users...", len(self.active_connections))
