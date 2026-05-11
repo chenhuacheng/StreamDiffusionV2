@@ -12,6 +12,7 @@ export PORT="${PORT:-7863}"
 export HOST="${HOST:-0.0.0.0}"
 export GPU_IDS="${GPU_IDS:-4,5,6,7}"
 export STEP="${STEP:-2}"
+export SCHEDULE_BLOCK="${SCHEDULE_BLOCK:-1}"
 export USE_TAEHV="${USE_TAEHV:-1}"
 export STREAMV2V_LOCK_RUNTIME_FLAGS="${STREAMV2V_LOCK_RUNTIME_FLAGS:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -92,7 +93,7 @@ while true; do
         echo
         echo "================================================================"
         echo "[watchdog-1p3b] $(date '+%Y-%m-%d %H:%M:%S') attempt #$attempt"
-        echo "[watchdog-1p3b]   PORT=$PORT GPU_IDS=$GPU_IDS STEP=$STEP USE_TAEHV=$USE_TAEHV"
+        echo "[watchdog-1p3b]   PORT=$PORT GPU_IDS=$GPU_IDS STEP=$STEP SCHEDULE_BLOCK=$SCHEDULE_BLOCK USE_TAEHV=$USE_TAEHV"
         echo "================================================================"
     } >> "$LOG_FILE" 2>&1
 
