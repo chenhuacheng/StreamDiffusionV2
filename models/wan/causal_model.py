@@ -28,6 +28,60 @@ except ModuleNotFoundError:
     flash_attn_interface = None
     FLASH_ATTN_AVAILABLE = False
 
+
+# Rate-limited warning emitter for kv-cache guard violations. Without this a
+# misbehaving streaming session would flood the log at ~30 msgs/sec/rank.
+_KVCACHE_WARN_STATE = {"count": 0, "stride": 1}
+
+
+def _kvcache_warn(msg: str) -> None:
+    _KVCACHE_WARN_STATE["count"] += 1
+    n = _KVCACHE_WARN_STATE["count"]
+    stride = _KVCACHE_WARN_STATE["stride"]
+    if n == 1 or (n % stride) == 0:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        # Use warnings (not print) so it goes through stderr and is visible
+        # alongside tracebacks.
+        warnings.warn(f"[kvcache-guard][rank{rank}][n={n}] {msg}", stacklevel=2)
+        if n >= 10 * stride:
+            _KVCACHE_WARN_STATE["stride"] = min(stride * 10, 10000)
+
+
+def _kvcache_slice_ok(start, end, num_new_tokens: int, cache_size: int) -> bool:
+    """Return True iff [start:end] is a valid write window for
+    `num_new_tokens` entries into a kv-cache of `cache_size`.
+
+    Centralising this guard makes the two call sites (direct rolling write
+    and evict write) share identical semantics and gives us a single place
+    to unit-test all the edge cases (negative start, start==end, tensor-
+    scalar index types, off-by-one under/over, wrap-around, etc.).
+
+    Requirements:
+      * 0 <= start              -- no negative starts (Python slice
+                                   semantics would silently turn [-20:0]
+                                   into an empty view of a non-empty RHS
+                                   and crash on broadcast).
+      * start < end             -- a zero-width slice cannot accept
+                                   non-zero-width roped_key/v.
+      * end <= cache_size       -- cannot overrun the pre-allocated cache.
+      * end - start == num_new_tokens
+                                -- width must match RHS exactly (same
+                                   reason as above, but from the other
+                                   direction).
+    Inputs may be plain Python ints or 0-dim torch tensors / numpy
+    scalars; they are coerced to int before comparison so mixed types
+    cannot produce a surprising "almost-equal" result.
+    """
+    try:
+        start_i = int(start)
+        end_i = int(end)
+        num_i = int(num_new_tokens)
+        cap_i = int(cache_size)
+    except (TypeError, ValueError):
+        return False
+    return (0 <= start_i < end_i <= cap_i) and (end_i - start_i == num_i)
+
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -273,10 +327,18 @@ class CausalWanSelfAttention(nn.Module):
                 self.evict_idx = [self.evict_idx[0].copy() for _ in range(cache_bs)]
                 
             for i, c_start in enumerate(current_start):
-                num_new_tokens = roped_query.shape[1]
-                current_end = c_start + roped_query.shape[1]
+                num_new_tokens = int(roped_query.shape[1])
+                # Normalise everything to Python ints up-front. Keeping these
+                # values as 0-d tensors (which they naturally become when
+                # `current_start` is a tensor) makes the slice math below very
+                # fragile: e.g. `tensor[-20:0]` has ambiguous semantics and
+                # can silently produce a zero-length view that then broadcasts
+                # a non-empty RHS and crashes the whole rank. Converting once
+                # here eliminates that class of bug.
+                c_start_i = int(c_start.item()) if torch.is_tensor(c_start) else int(c_start)
+                current_end = c_start_i + num_new_tokens
                 sink_tokens = self.sink_size * frame_seqlen
-                
+
                 if sink_tokens > 0 and self.adapt_sink_thr > -1 and v.shape[1] <= frame_seqlen:
                     # Caculate similarity between new keys/values and the oldest ones in the cache
                     k_sink_mean = kv_cache["k"][i:i+1, :sink_tokens].reshape(self.sink_size, frame_seqlen, -1).mean(1)
@@ -296,44 +358,100 @@ class CausalWanSelfAttention(nn.Module):
 
                 # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
                 if current_end > kv_cache_size:
-                    kv_cache["global_end_index"][i].fill_(c_start)
+                    kv_cache["global_end_index"][i].fill_(c_start_i)
                     kv_cache["local_end_index"][i].fill_(kv_cache_size)
 
-                if (current_end > kv_cache["global_end_index"][i].item()) and (
-                        num_new_tokens + kv_cache["local_end_index"][i].item() > kv_cache_size):
+                global_end_i = int(kv_cache["global_end_index"][i].item())
+                local_end_i = int(kv_cache["local_end_index"][i].item())
 
-                    target_end = self.evict_idx[i][0]
+                if (current_end > global_end_i) and (
+                        num_new_tokens + local_end_i > kv_cache_size):
 
-                    # current_step = kv_cache['current_step']
-                    # Update the buffer
-                    if cache_bs==1 and kv_cache['current_step'] > 1:
-                        kv_cache['current_step']-=1
+                    if not self.evict_idx[i]:
+                        # Should never happen in steady state, but if the
+                        # eviction queue is empty we cannot pick a slot to
+                        # overwrite. Skip the write, leave bookkeeping at
+                        # its current (already-consistent) value, and move
+                        # on — the next frame will refill evict_idx.
+                        _kvcache_warn(
+                            f"self_attn: evict_idx[{i}] empty while eviction "
+                            f"required (num_new={num_new_tokens}, "
+                            f"local_end={local_end_i}, cache_size={kv_cache_size}); "
+                            f"skipping kv-cache update"
+                        )
+                        local_end_index = local_end_i
                     else:
-                        evict_idx = self.evict_idx[i].pop(0)
-                        if evict_idx > sink_tokens:
-                            self.evict_idx[i].append(evict_idx)
-                        kv_cache['current_step']=kv_cache['total_steps']
+                        target_end = self.evict_idx[i][0]
 
-                    # print(f"self.evict_idx: {self.evict_idx[i]}, total steps: {kv_cache['total_steps']}, current step: {current_step}, target: {target_end-num_new_tokens}:{target_end}, kv size:{kv_cache_size}")
+                        # current_step = kv_cache['current_step']
+                        # Update the buffer
+                        if cache_bs==1 and kv_cache['current_step'] > 1:
+                            kv_cache['current_step']-=1
+                        else:
+                            evict_idx = self.evict_idx[i].pop(0)
+                            if evict_idx > sink_tokens:
+                                self.evict_idx[i].append(evict_idx)
+                            kv_cache['current_step']=kv_cache['total_steps']
 
-                    # Newly added cache covers the oldest one
-                    kv_cache["k"][i:i+1, target_end-num_new_tokens:target_end] = roped_key[i:i+1]
-                    kv_cache["v"][i:i+1, target_end-num_new_tokens:target_end] = v[i:i+1]
+                        # print(f"self.evict_idx: {self.evict_idx[i]}, total steps: {kv_cache['total_steps']}, current step: {current_step}, target: {target_end-num_new_tokens}:{target_end}, kv size:{kv_cache_size}")
 
-                    local_end_index = kv_cache["local_end_index"][i].item()
+                        # Newly added cache covers the oldest one. Guard the
+                        # slice: if target_end / num_new_tokens are not
+                        # consistent with the cache dims the write can
+                        # silently become zero-length and broadcast-crash.
+                        evict_start = target_end - num_new_tokens
+                        evict_stop = target_end
+                        if _kvcache_slice_ok(evict_start, evict_stop,
+                                             num_new_tokens, kv_cache_size):
+                            kv_cache["k"][i:i+1, evict_start:evict_stop] = roped_key[i:i+1]
+                            kv_cache["v"][i:i+1, evict_start:evict_stop] = v[i:i+1]
+                        else:
+                            _kvcache_warn(
+                                f"self_attn: evict write out of range "
+                                f"[{evict_start}:{evict_stop}] (num_new={num_new_tokens}, "
+                                f"cache_size={kv_cache_size}); skipping"
+                            )
+
+                        local_end_index = local_end_i
 
                 else:
-                    local_end_index = kv_cache["local_end_index"][i].item() + current_end - kv_cache["global_end_index"][i].item()
+                    local_end_index = local_end_i + current_end - global_end_i
 
-                    rolling_end = (current_end + num_new_tokens).item()
+                    rolling_end = current_end + num_new_tokens
                     if rolling_end > self.sink_size * frame_seqlen and rolling_end <= kv_cache_size \
                         and (not self.evict_idx[i] or self.evict_idx[i][-1] != rolling_end):
                         self.evict_idx[i].append(rolling_end)
 
                     local_start_index = local_end_index - num_new_tokens
                     # print(f"target: {local_start_index}:{local_end_index}")
-                    kv_cache["k"][i:i+1, local_start_index:local_end_index] = roped_key[i:i+1]
-                    kv_cache["v"][i:i+1, local_start_index:local_end_index] = v[i:i+1]
+                    # Guard: in streaming edge cases (user pause / client
+                    # disconnect / pipeline rollback / chunk boundary
+                    # misalignment) the window can collapse to zero length
+                    # OR wrap into negative / out-of-range territory. A
+                    # simple `end > start` check is NOT enough: Python slice
+                    # semantics make e.g. `k[:, -20:0]` a zero-length view
+                    # that then broadcast-crashes the non-empty RHS and
+                    # takes down the whole rank (and with NCCL the peer
+                    # ranks too). Require the slice to land fully inside
+                    # the cache and to have exactly `num_new_tokens` width.
+                    if _kvcache_slice_ok(local_start_index, local_end_index,
+                                         num_new_tokens, kv_cache_size):
+                        kv_cache["k"][i:i+1, local_start_index:local_end_index] = roped_key[i:i+1]
+                        kv_cache["v"][i:i+1, local_start_index:local_end_index] = v[i:i+1]
+                    else:
+                        _kvcache_warn(
+                            f"self_attn: rolling write out of range "
+                            f"[{local_start_index}:{local_end_index}] "
+                            f"(num_new={num_new_tokens}, cache_size={kv_cache_size}, "
+                            f"c_start={c_start_i}, current_end={current_end}, "
+                            f"global_end={global_end_i}, local_end={local_end_i}); "
+                            f"skipping kv-cache update"
+                        )
+                        # Clamp local_end_index so attention sees a valid
+                        # prefix and the next frame can recover instead of
+                        # propagating a poisoned (possibly negative) value
+                        # into global_end_index / local_end_index.
+                        local_end_index = max(0, min(local_end_index, kv_cache_size))
 
                 seq_lens.append(local_end_index)
 
