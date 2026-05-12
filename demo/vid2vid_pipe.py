@@ -72,14 +72,13 @@ def _runtime_flags_locked() -> bool:
 
 
 def _resolve_requested_runtime_flag(runtime_state, key: str, current: bool) -> bool:
-    """Resolve frontend-requested toggle for use_taehv/use_tensorrt.
+    """Always return the launch-time value.
 
-    When STREAMV2V_LOCK_RUNTIME_FLAGS is enabled, we always pin to the
-    current (launch-time) value so the worker never enters the rebuild path.
+    use_taehv / use_tensorrt are pinned at startup and must NEVER be
+    toggled at runtime — rebuilding the pipeline mid-session causes
+    output stalls and is extremely expensive on 1.3B+ models.
     """
-    if _runtime_flags_locked():
-        return current
-    return bool(runtime_state.get(key, current))
+    return current
 
 
 def _rebuild_pipeline_for_runtime_options(
@@ -91,6 +90,19 @@ def _rebuild_pipeline_for_runtime_options(
     requested_use_taehv: bool,
     requested_use_tensorrt: bool,
 ):
+    # ── HARD LOCK: never rebuild at runtime ──
+    # use_taehv and use_tensorrt are set once at startup.  Rebuilding
+    # the pipeline mid-session is prohibitively expensive and causes
+    # output stalls.  Always return the existing manager unchanged.
+    if current_manager is not None:
+        current_manager.logger.info(
+            "[HARD_LOCK] Ignoring rebuild request on rank %s "
+            "(requested use_taehv=%s, use_tensorrt=%s); keeping launch-time settings.",
+            rank,
+            requested_use_taehv,
+            requested_use_tensorrt,
+        )
+        return current_manager
     # When STREAMV2V_LOCK_RUNTIME_FLAGS=1, ignore frontend toggle of
     # use_taehv/use_tensorrt to avoid rebuilding the (very large) 14B FSDP
     # pipeline at runtime — rebuilds for 14B can OOM because old FSDP shards
@@ -206,10 +218,12 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 # stop_event can break us out). The large NCCL timeout set
                 # in init_dist_tcp (30 min default) gives this plenty of
                 # headroom before the process group self-aborts.
+                _s07_t0 = time.time()
                 images = read_images_from_queue(
                     input_queue, first_batch_num_frames, device, stop_event,
                     idle_timeout_sec=None,
                 )
+                runtime_state["s07_read_queue_ms"] = (time.time() - _s07_t0) * 1000
                 if images is None:
                     # stop_event was set => graceful shutdown.
                     return
@@ -235,10 +249,12 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 # downstream ranks (which are blocked in recv_latent_data).
                 # Default 15s is well under the 60s NCCL timeout we set
                 # in init_dist_tcp.
+                _s07_t0 = time.time()
                 images = read_images_from_queue(
                     input_queue, chunk_size, device, stop_event,
                     idle_timeout_sec=float(os.environ.get("STREAMV2V_CHUNK_IDLE_SEC", "15")),
                 )
+                runtime_state["s07_read_queue_ms"] = (time.time() - _s07_t0) * 1000
                 if images is None:
                     # CRITICAL: rank 0's input queue went idle mid-stream
                     # (WebSocket disconnect / pipeline.close()). The other
@@ -284,12 +300,17 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 pipeline_manager._sync_for_timing(schedule_block)
                 start_dit = time.time()
                 t_vae = start_dit - start_vae
+                # ── Stage 8: VAE encode timing from schedule_block ──
+                runtime_state["s08_vae_encode_ms"] = t_vae * 1000
 
+            # ── Stage 9: DiT rank0 ──
+            _s09_t0 = time.time()
             denoised_pred, patched_x_shape = pipeline_manager.run_demo_input_step(
                 session=session,
                 block_num=block_num[rank],
                 previous_latent_data=latent_data if "latent_data" in locals() else None,
             )
+            runtime_state["s09_dit_rank0_ms"] = (time.time() - _s09_t0) * 1000
 
             if schedule_block:
                 pipeline_manager._sync_for_timing(schedule_block)
@@ -308,6 +329,8 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
             torch.cuda.current_stream().wait_stream(pipeline_manager.com_stream)
             pipeline_manager._wait_for_outstanding(outstanding)
 
+            # ── Stage 10: NCCL send_latent_data_async ──
+            _s10_t0 = time.time()
             with torch.cuda.stream(pipeline_manager.com_stream):
                 work_objects = pipeline_manager.data_transfer.send_latent_data_async(
                     chunk_idx=session.chunk_idx,
@@ -322,6 +345,7 @@ def input_process(rank, block_num, total_blocks, args, runtime_state, prepare_ev
                 if schedule_block and pipeline_manager.processed >= pipeline_manager.schedule_step:
                     pipeline_manager._handle_block_scheduling(block_num, total_blocks=total_blocks)
                     schedule_block = False
+            runtime_state["s10_nccl_send_ms"] = (time.time() - _s10_t0) * 1000
 
             if schedule_block:
                 t_total = pipeline_manager.t_dit + t_vae
@@ -412,7 +436,10 @@ def output_process(rank, block_num, total_blocks, args, runtime_state, prepare_e
                 pipeline_manager._sync_for_timing(schedule_block)
                 start_dit = time.time()
 
+            # ── Stage 11: DiT last rank ──
+            _s11_t0 = time.time()
             denoised_pred, _ = pipeline_manager._run_worker_stage("output", latent_data, block_num[rank])
+            runtime_state["s11_dit_last_rank_ms"] = (time.time() - _s11_t0) * 1000
 
             if schedule_block:
                 pipeline_manager._sync_for_timing(schedule_block)
@@ -429,8 +456,16 @@ def output_process(rank, block_num, total_blocks, args, runtime_state, prepare_e
                     pipeline_manager._sync_for_timing(schedule_block)
                     start_vae = time.time()
 
-                for image in pipeline_manager._decode_prediction(denoised_pred):
+                # ── Stage 12: VAE decode ──
+                _s12_t0 = time.time()
+                decoded_images = list(pipeline_manager._decode_prediction(denoised_pred))
+                runtime_state["s12_vae_decode_ms"] = (time.time() - _s12_t0) * 1000
+
+                # ── Stage 13: output_queue.put ──
+                _s13_t0 = time.time()
+                for image in decoded_images:
                     output_queue.put(image)
+                runtime_state["s13_output_queue_put_ms"] = (time.time() - _s13_t0) * 1000
 
                 torch.cuda.synchronize()
 
