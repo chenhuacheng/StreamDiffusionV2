@@ -53,6 +53,19 @@ class App:
             self.user_batch_count = {}  # user_id -> count of batches collected
             self.user_latency_history = {}  # user_id -> list of latencies for statistics
             self.user_raw_data = {}  # user_id -> list of raw batch data (for logging)
+            # ── Stage-level timing (18 stages) ──
+            # Rolling window of per-batch stage timings for the monitor dashboard.
+            # Each entry is a dict with keys like "s03_ws_recv_ms", "s05_push_pipeline_ms", etc.
+            self.stage_timing_history = deque(maxlen=200)
+            self.stage_timing_lock = threading.Lock()
+            # Per-user staging area: individual stage timings collected as frames flow through
+            self._user_stage3_ms = {}   # WS recv + JPEG decode + throttle
+            self._user_stage4_ms = {}   # update_data (param merge)
+            self._user_stage5_ms = {}   # push to pipeline (accept_new_params)
+            self._user_stage6_ms = {}   # input_queue put (inside accept_new_params)
+            self._user_stage14_ms = {}  # produce_predictions: pipeline.produce_outputs()
+            self._user_stage15_ms = {}  # pil_to_frame JPEG encode
+            self._user_stage16_ms = {}  # output_queue → generate() yield
             # First-frame latency tracking: for each user, remember the
             # timestamp when their *first* input frame entered the pipeline
             # queue (push_frames_to_pipeline).  When the matching output
@@ -126,9 +139,9 @@ class App:
                 return HTTPException(status_code=404, detail="User not found")
             last_time = time.time()
             last_frame_time = None
-            # 16 FPS throttling: minimum interval between frames (1/16 seconds)
-            TARGET_FPS = 16.0
-            min_frame_interval = 1.0 / TARGET_FPS
+            # Input FPS throttling disabled for benchmarking
+            TARGET_FPS = 9999.0
+            min_frame_interval = 0.0
             last_frame_received_time = None
             try:
                 while True:
@@ -181,6 +194,7 @@ class App:
                         upload_completed = self.conn_manager.is_video_upload_completed(user_id)
                         # Only receive image bytes if not in upload mode, or upload not completed yet
                         if (not is_upload_mode) or (is_upload_mode and not upload_completed):
+                            _s3_t0 = time.time()
                             image_data = await self.conn_manager.receive_bytes(user_id)
                             if len(image_data) == 0:
                                 await self.conn_manager.send_json(
@@ -189,12 +203,12 @@ class App:
                                 # await asyncio.sleep(sleep_time)
                                 continue
                             
-                            # 16 FPS throttling: only process frames at 16 FPS rate
+                            # 15 FPS throttling: only process frames at 15 FPS rate
                             current_time = time.time()
                             if last_frame_received_time is not None:
                                 time_since_last_frame = current_time - last_frame_received_time
                                 if time_since_last_frame < min_frame_interval:
-                                    # Skip this frame to maintain 16 FPS
+                                    # Skip this frame to maintain 15 FPS
                                     await self.conn_manager.send_json(user_id, {"status": "send_frame"})
                                     continue
                             
@@ -207,10 +221,19 @@ class App:
                             # For camera mode, set current image directly
                             if not is_upload_mode:
                                 params.image = bytes_to_pil(image_data)
+                            # ── Stage 3: WS recv + JPEG decode + throttle ──
+                            if self.enable_metrics:
+                                _s3_elapsed = (time.time() - _s3_t0) * 1000
+                                self._user_stage3_ms[user_id] = _s3_elapsed
                         else:
                             # Upload already completed: do not receive more bytes; image will be fed from cached frames
                             pass
+                    # ── Stage 4: update_data (param merge) ──
+                    if self.enable_metrics:
+                        _s4_t0 = time.time()
                     await self.conn_manager.update_data(user_id, params)
+                    if self.enable_metrics:
+                        self._user_stage4_ms[user_id] = (time.time() - _s4_t0) * 1000
                     await self.conn_manager.send_json(user_id, {"status": "wait"})
                     if last_frame_time is None:
                         last_frame_time = time.time()
@@ -363,6 +386,83 @@ class App:
                 logging.error(f"Error getting summary metrics: {e}")
                 return JSONResponse({"error": str(e)}, status_code=500)
 
+        @self.app.get("/api/stage_metrics")
+        async def get_stage_metrics(window_size: int = 50):
+            """Return the latest stage-level timing breakdown for the monitor.
+
+            Each stage entry contains:
+              - value: timing in ms (None if not yet collected)
+              - type: "measured" | "gpu_measured" | "estimated"
+
+            Stages marked "estimated" are heuristic values for phases that
+            cannot be observed on the server (frontend capture/encode,
+            network transit, frontend decode/render).
+            """
+            if not self.enable_metrics:
+                return JSONResponse({
+                    "enabled": False,
+                    "reason": "start demo with --enable-metrics to populate",
+                })
+            try:
+                with self.stage_timing_lock:
+                    history = list(self.stage_timing_history)
+                recent = history[-window_size:] if len(history) > window_size else history
+                if not recent:
+                    return JSONResponse({
+                        "enabled": True,
+                        "samples": 0,
+                        "latest": None,
+                        "averages": None,
+                    })
+
+                # Compute averages across the window
+                stage_keys = [k for k in recent[-1].keys()
+                              if k.startswith("s") and k[1:3].isdigit()]
+                averages = {}
+                for sk in stage_keys:
+                    vals = []
+                    stype = "measured"
+                    for r in recent:
+                        entry = r.get(sk)
+                        if isinstance(entry, dict):
+                            stype = entry.get("type", "measured")
+                            if entry.get("value") is not None:
+                                vals.append(entry["value"])
+                    if vals:
+                        averages[sk] = {
+                            "mean_ms": round(sum(vals) / len(vals), 2),
+                            "min_ms": round(min(vals), 2),
+                            "max_ms": round(max(vals), 2),
+                            "samples": len(vals),
+                            "type": stype,
+                        }
+                    else:
+                        averages[sk] = {
+                            "mean_ms": None,
+                            "samples": 0,
+                            "type": stype,
+                        }
+
+                # Total averages
+                total_measured_vals = [r.get("total_measured_ms", 0) for r in recent if r.get("total_measured_ms")]
+                total_estimated_vals = [r.get("total_estimated_ms", 0) for r in recent if r.get("total_estimated_ms")]
+                total_vals = [r.get("total_ms", 0) for r in recent if r.get("total_ms")]
+
+                return JSONResponse({
+                    "enabled": True,
+                    "samples": len(recent),
+                    "latest": recent[-1],
+                    "averages": averages,
+                    "total_avg": {
+                        "measured_ms": round(sum(total_measured_vals) / len(total_measured_vals), 2) if total_measured_vals else None,
+                        "estimated_ms": round(sum(total_estimated_vals) / len(total_estimated_vals), 2) if total_estimated_vals else None,
+                        "total_ms": round(sum(total_vals) / len(total_vals), 2) if total_vals else None,
+                    },
+                })
+            except Exception as e:
+                logging.error(f"Error getting stage metrics: {e}")
+                return JSONResponse({"error": str(e)}, status_code=500)
+
         @self.app.get("/api/metrics/{user_id}")
         async def get_metrics(user_id: uuid.UUID, window_size: int = 100):
             """Get SLO metrics for a specific user"""
@@ -400,9 +500,9 @@ class App:
                 async def push_frames_to_pipeline():
                     last_params = SimpleNamespace()
                     sleep_time = 1 / 20  # Initial guess
-                    # 16 FPS throttling for upload mode
-                    TARGET_FPS = 16.0
-                    min_frame_interval = 1.0 / TARGET_FPS
+                    # FPS throttling disabled for benchmarking
+                    TARGET_FPS = 9999.0
+                    min_frame_interval = 0.0
                     last_frame_sent_time = None
                     while True:
                         # Check if upload mode is enabled
@@ -410,12 +510,12 @@ class App:
                         is_upload_mode = video_status.get("is_upload_mode", False)
                         
                         if is_upload_mode:
-                            # Upload mode: get next frame from video queue with 16 FPS throttling
+                            # Upload mode: no FPS throttling (benchmarking)
                             current_time = time.time()
-                            if last_frame_sent_time is not None:
+                            if False and last_frame_sent_time is not None:
                                 time_since_last_frame = current_time - last_frame_sent_time
                                 if time_since_last_frame < min_frame_interval:
-                                    # Wait to maintain 16 FPS
+                                    # Wait to maintain 15 FPS
                                     await asyncio.sleep(min_frame_interval - time_since_last_frame)
                             
                             video_frame = await self.conn_manager.get_next_video_frame(user_id)
@@ -459,7 +559,8 @@ class App:
                                 last_params = params
                                 # Record input timestamp when frame is added to pipeline queue
                                 if self.enable_metrics:
-                                    input_timestamp = time.time()
+                                    _s5_t0 = time.time()
+                                    input_timestamp = _s5_t0
                                     with self.user_metrics_lock:
                                         if user_id not in self.user_input_timestamps:
                                             self.user_input_timestamps[user_id] = deque()
@@ -467,6 +568,9 @@ class App:
                                         if user_id not in self.user_first_input_ts:
                                             self.user_first_input_ts[user_id] = input_timestamp
                                 self.pipeline.accept_new_params(params)
+                                # ── Stage 5: push to pipeline (accept_new_params + queue put) ──
+                                if self.enable_metrics:
+                                    self._user_stage5_ms[user_id] = (time.time() - _s5_t0) * 1000
                             await self.conn_manager.send_json(
                                 user_id, {"status": "send_frame"}
                             )
@@ -501,11 +605,14 @@ class App:
 
                         last_queue_size = queue_size
                         try:
+                            _s16_t0 = time.time() if self.enable_metrics else 0
                             frame = await self.conn_manager.get_frame(user_id)
                             if frame is None:
                                 break
                             
-                            # Output timestamp is already recorded in produce_predictions
+                            # ── Stage 16: output_queue → generate() yield ──
+                            if self.enable_metrics:
+                                self._user_stage16_ms[user_id] = (time.time() - _s16_t0) * 1000
                             
                             yield frame
                             if not is_firefox(request.headers.get("user-agent", "")):
@@ -525,10 +632,24 @@ class App:
 
                 def produce_predictions(user_id, loop, stop_event):
                     while not stop_event.is_set():
+                        # ── Stage 14: produce_outputs (get from output_queue) ──
+                        if self.enable_metrics:
+                            _s14_t0 = time.time()
                         images = self.pipeline.produce_outputs()
                         if len(images) == 0:
                             time.sleep(THROTTLE)
                             continue
+                        if self.enable_metrics:
+                            _s14_ms = (time.time() - _s14_t0) * 1000
+                            self._user_stage14_ms[user_id] = _s14_ms
+
+                        # ── Stage 15: pil_to_frame JPEG encode ──
+                        if self.enable_metrics:
+                            _s15_t0 = time.time()
+                        encoded_frames = list(map(pil_to_frame, images))
+                        if self.enable_metrics:
+                            _s15_ms = (time.time() - _s15_t0) * 1000
+                            self._user_stage15_ms[user_id] = _s15_ms
                         
                         # Calculate latency for each output frame using FIFO timestamp queue
                         if self.enable_metrics:
@@ -604,11 +725,14 @@ class App:
                                             self.user_batch_count[user_id] = 0
                                             self.user_latency_history[user_id] = []
                                             self.user_raw_data[user_id] = []
+
+                            # ── Assemble stage timing record for this batch ──
+                            self._assemble_stage_timing(user_id)
                         
                         asyncio.run_coroutine_threadsafe(
                             self.conn_manager.put_frames_to_output_queue(
                                 user_id,
-                                list(map(pil_to_frame, images))
+                                encoded_frames
                             ),
                             loop
                         )
@@ -686,6 +810,82 @@ class App:
         async def shutdown_event():
             LOGGER.info("Shutdown event triggered, cleaning up...")
             await self.cleanup()
+
+    def _assemble_stage_timing(self, user_id):
+        """Assemble a complete stage timing record from per-user staging areas
+        and GPU-side runtime_state, then append to stage_timing_history.
+
+        Called from produce_predictions after each batch.
+
+        Stage classification:
+          - "measured": precise server-side timing
+          - "estimated": cannot be measured on server; value is a heuristic
+          - "gpu_measured": measured inside the GPU worker process
+        """
+        try:
+            # Read GPU-side timings from runtime_state (Manager dict, cross-process)
+            rs = getattr(self.pipeline, 'runtime_state', None) or {}
+            gpu_stages = {}
+            for key in (
+                "s07_read_queue_ms", "s08_vae_encode_ms",
+                "s09_dit_rank0_ms", "s10_nccl_send_ms",
+                "s11_dit_last_rank_ms", "s12_vae_decode_ms",
+                "s13_output_queue_put_ms",
+            ):
+                v = rs.get(key)
+                if v is not None:
+                    gpu_stages[key] = float(v)
+
+            # Collect backend-side per-user timings
+            record = {
+                "ts": time.time(),
+                "user_id": str(user_id),
+                # ── Frontend (estimated) ──
+                "s01_camera_capture_ms":    {"value": 2.0, "type": "estimated"},
+                "s02_jpeg_encode_ms":       {"value": 3.0, "type": "estimated"},
+                # ── Backend WS receive ──
+                "s03_ws_recv_decode_ms":    {"value": self._user_stage3_ms.get(user_id),  "type": "measured"},
+                "s04_update_data_ms":       {"value": self._user_stage4_ms.get(user_id),  "type": "measured"},
+                "s05_push_pipeline_ms":     {"value": self._user_stage5_ms.get(user_id),  "type": "measured"},
+                # ── Queue waiting ──
+                "s06_input_queue_wait_ms":  {"value": gpu_stages.get("s07_read_queue_ms"), "type": "gpu_measured",
+                                             "note": "included in s07 read_images_from_queue"},
+                # ── GPU processing ──
+                "s07_read_queue_ms":        {"value": gpu_stages.get("s07_read_queue_ms"), "type": "gpu_measured"},
+                "s08_vae_encode_ms":        {"value": gpu_stages.get("s08_vae_encode_ms"), "type": "gpu_measured"},
+                "s09_dit_rank0_ms":         {"value": gpu_stages.get("s09_dit_rank0_ms"),  "type": "gpu_measured"},
+                "s10_nccl_send_ms":         {"value": gpu_stages.get("s10_nccl_send_ms"),  "type": "gpu_measured"},
+                "s11_dit_last_rank_ms":     {"value": gpu_stages.get("s11_dit_last_rank_ms"), "type": "gpu_measured"},
+                "s12_vae_decode_ms":        {"value": gpu_stages.get("s12_vae_decode_ms"), "type": "gpu_measured"},
+                "s13_output_queue_put_ms":  {"value": gpu_stages.get("s13_output_queue_put_ms"), "type": "gpu_measured"},
+                # ── Backend output side ──
+                "s14_produce_outputs_ms":   {"value": self._user_stage14_ms.get(user_id), "type": "measured"},
+                "s15_pil_to_frame_ms":      {"value": self._user_stage15_ms.get(user_id), "type": "measured"},
+                "s16_output_yield_ms":      {"value": self._user_stage16_ms.get(user_id), "type": "measured"},
+                # ── Network + frontend (estimated) ──
+                "s17_http_chunked_ms":      {"value": 1.0, "type": "estimated"},
+                "s18_frontend_decode_ms":   {"value": 2.0, "type": "estimated"},
+            }
+
+            # Compute measured total (sum of all non-None measured/gpu_measured values)
+            measured_total = 0.0
+            estimated_total = 0.0
+            for k, v in record.items():
+                if not k.startswith("s") or k in ("ts", "user_id"):
+                    continue
+                if isinstance(v, dict) and v.get("value") is not None:
+                    if v["type"] == "estimated":
+                        estimated_total += v["value"]
+                    else:
+                        measured_total += v["value"]
+            record["total_measured_ms"] = measured_total
+            record["total_estimated_ms"] = estimated_total
+            record["total_ms"] = measured_total + estimated_total
+
+            with self.stage_timing_lock:
+                self.stage_timing_history.append(record)
+        except Exception as e:
+            LOGGER.debug("_assemble_stage_timing error: %s", e)
 
     def _log_metrics_to_file(self, user_id: uuid.UUID):
         """Log metrics to file after collecting 1000 batches"""

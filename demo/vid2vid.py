@@ -188,6 +188,7 @@ class Pipeline:
             self.input_queue.put(image_array)
 
         if hasattr(params, "prompt") and params.prompt and self.prompt != params.prompt:
+            LOGGER.info("[accept_new_params] prompt changed: %r -> %r", self.prompt, params.prompt)
             self.prompt = params.prompt
             self.runtime_state["prompt"] = self.prompt
 

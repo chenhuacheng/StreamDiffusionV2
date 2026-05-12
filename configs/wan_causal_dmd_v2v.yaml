@@ -51,7 +51,7 @@ distillation_loss: dmd
 gradient_checkpointing: true
 backward_simulation: false
 num_frame_per_block: 1
-num_kv_cache: 6
+num_kv_cache: 5
 num_sink_tokens: 3
 adapt_sink_threshold: 0.2
 warp_denoising_step: false

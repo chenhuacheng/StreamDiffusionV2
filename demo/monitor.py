@@ -176,6 +176,23 @@ def collect_metrics(demo_port, timeout=3):
     }
 
 
+def collect_stage_metrics(demo_port, timeout=3):
+    """Fetch /api/stage_metrics from the demo.
+    Returns the JSON payload on success, or a dict with status/reason on failure.
+    """
+    url = f"http://127.0.0.1:{demo_port}/api/stage_metrics?window_size=50"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "monitor"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(65536).decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+    except Exception as e:
+        return {"status": "error", "reason": str(e)[:200]}
+    if not payload.get("enabled", False):
+        return {"status": "disabled", "reason": payload.get("reason", "stage metrics disabled")}
+    return {"status": "ok", "data": payload}
+
+
 def tail_log(path, n=80):
     if not path or not os.path.exists(path):
         return []
@@ -384,8 +401,66 @@ def overall_status(snap):
     return "GREEN", "all systems nominal"
 
 
+def collect_launch_config():
+    """从 demo main.py 进程的 /proc/<pid>/environ 中提取启动配置参数。"""
+    # 感兴趣的环境变量
+    keys = [
+        "STEP", "MODEL_TYPE", "GPU_IDS", "USE_TAEHV", "USE_TENSORRT",
+        "FAST", "SCHEDULE_BLOCK", "STREAMV2V_LOCK_RUNTIME_FLAGS",
+        "TARGET_LATENCY", "ENABLE_METRICS", "PORT", "HOST",
+        "STREAMV2V_MASTER_PORT", "STREAMV2V_NCCL_TIMEOUT_SEC",
+        "CONFIG_PATH", "CHECKPOINT_FOLDER", "NCCL_P2P_DISABLE", "NCCL_IB_DISABLE",
+        "PYTHONPATH",
+    ]
+    # 找 main.py 进程的 PID
+    out, rc = sh("pgrep -f 'main.py --port'")
+    if rc != 0 or not out.strip():
+        return {}
+    pid = out.strip().splitlines()[0]
+    try:
+        with open(f"/proc/{pid}/environ", "r") as f:
+            env_data = f.read()
+        env_pairs = env_data.split("\0")
+        env_dict = {}
+        for pair in env_pairs:
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                env_dict[k] = v
+        config = {}
+        for k in keys:
+            if k in env_dict:
+                config[k] = env_dict[k]
+        return config
+    except Exception:
+        return {}
+
+
+# 缓存启动配置，按 demo PID 变化自动刷新（demo 重启后无需重启 monitor）
+_LAUNCH_CONFIG_CACHE = None
+_LAUNCH_CONFIG_PID = None
+
+
+def _get_demo_pid():
+    """获取当前 demo main.py 进程的 PID，找不到返回 None。"""
+    out, rc = sh("pgrep -f 'main.py --port'")
+    if rc != 0 or not out.strip():
+        return None
+    return out.strip().splitlines()[0]
+
+
+def get_launch_config():
+    global _LAUNCH_CONFIG_CACHE, _LAUNCH_CONFIG_PID
+    current_pid = _get_demo_pid()
+    # PID 变了（demo 重启）或从未采集过 → 重新读取
+    if current_pid != _LAUNCH_CONFIG_PID or _LAUNCH_CONFIG_CACHE is None:
+        _LAUNCH_CONFIG_CACHE = collect_launch_config()
+        _LAUNCH_CONFIG_PID = current_pid
+    return _LAUNCH_CONFIG_CACHE
+
+
 def take_snapshot():
     snap = {"ts": int(time.time()), "iso": datetime.now().isoformat(timespec="seconds")}
+    snap["launch_config"] = get_launch_config()
     snap["gpus"] = collect_gpus(ARGS.gpu_ids_set)
     snap["ports"] = collect_ports([ARGS.demo_port, ARGS.master_port])
     procs = collect_processes()
@@ -403,6 +478,7 @@ def take_snapshot():
     #   * 200 + enabled=false   -> metrics disabled (surface a friendly msg)
     #   * anything else         -> surface the transport error
     snap["metrics"] = collect_metrics(ARGS.demo_port)
+    snap["stage_metrics"] = collect_stage_metrics(ARGS.demo_port)
     # Live throughput (input/output FPS + queue) parsed from the demo log.
     # Cheap: grep tail of the file. Window default 30s.
     metric_rows = parse_metrics_tail(ARGS.log, max_lines=400)
@@ -490,6 +566,8 @@ a{color:#58a6ff;text-decoration:none}
   <small><a href="/api/status" target="_blank">JSON</a></small>
   <small><a href="/api/log" target="_blank">log tail</a></small>
   <small><a href="/healthz" target="_blank">healthz</a></small>
+  <small><a href="/download/pipeline_analysis.md" download style="color:#3fb950;font-weight:600">📄 Pipeline 分析报告</a></small>
+  <small><a href="/download/chat_summary.md" download="StreamDiffusionV2_多卡分析.md" style="background:#238636;color:#fff;padding:2px 10px;border-radius:4px;font-weight:600">⬇ 多卡并行分析文档</a></small>
 </div>
 
 <div class="grid" style="margin-top:12px">
@@ -497,6 +575,7 @@ a{color:#58a6ff;text-decoration:none}
   <div class="card"><h2>ports & api</h2><div id="ports"></div></div>
   <div class="card"><h2>log health</h2><div id="loghealth"></div></div>
   <div class="card"><h2>live throughput</h2><div id="throughput"></div></div>
+  <div class="card" style="grid-column:span 2"><h2>launch config (启动配置)</h2><div id="launchcfg"></div></div>
 </div>
 
 <h2>latency</h2>
@@ -506,6 +585,14 @@ a{color:#58a6ff;text-decoration:none}
     <div id="e2estats" style="margin-bottom:8px"></div>
     <table id="histtab"><thead><tr><th>bucket (ms)</th><th>count</th><th style="width:55%">bar</th></tr></thead><tbody></tbody></table>
   </div>
+</div>
+
+<h2>18-stage pipeline breakdown</h2>
+<div class="card" style="margin-bottom:12px">
+  <div id="stagesummary" style="margin-bottom:8px"></div>
+  <table id="stagetab"><thead><tr>
+    <th>#</th><th>stage</th><th>type</th><th style="width:8%">mean</th><th style="width:8%">min</th><th style="width:8%">max</th><th style="width:40%">bar</th>
+  </tr></thead><tbody></tbody></table>
 </div>
 
 <h2>GPUs</h2>
@@ -561,8 +648,14 @@ async function refresh(){
   // live throughput (input fps / output fps / queue) — parsed from demo log
   renderThroughput(s.throughput||{});
 
+  // launch config
+  renderLaunchConfig(s.launch_config||{});
+
   // latency: first-frame + e2e histogram
   renderLatency(s.metrics||{status:'error',reason:'no metrics payload'});
+
+  // 18-stage pipeline breakdown
+  renderStages(s.stage_metrics||{status:'error',reason:'no stage metrics'});
 
   // gpus
   document.querySelector('#gputab tbody').innerHTML=s.gpus.map(g=>{
@@ -601,6 +694,41 @@ async function refresh(){
   pre.scrollTop=pre.scrollHeight;
 }
 function kv(k,v,cls){return `<div class="kv"><span>${k}</span><span class="${cls||''}">${v}</span></div>`}
+
+function renderLaunchConfig(cfg){
+  const el=document.getElementById('launchcfg');
+  if(!cfg || Object.keys(cfg).length===0){
+    el.innerHTML='<small>unable to read launch config (demo process not found)</small>';
+    return;
+  }
+  // 高亮关键参数
+  const highlights = {
+    'STEP': v=> kv('STEP', v, 'ok'),
+    'MODEL_TYPE': v=> kv('MODEL_TYPE', v),
+    'GPU_IDS': v=> kv('GPU_IDS', v),
+    'USE_TAEHV': v=> kv('USE_TAEHV', v, v==='1'?'ok':'warn'),
+    'USE_TENSORRT': v=> kv('USE_TENSORRT', v, v==='1'?'ok':''),
+    'SCHEDULE_BLOCK': v=> kv('SCHEDULE_BLOCK', v, v==='0'?'ok':'warn'),
+    'STREAMV2V_LOCK_RUNTIME_FLAGS': v=> kv('LOCK_RUNTIME_FLAGS', v, v==='1'?'ok':'warn'),
+    'TARGET_LATENCY': v=> kv('TARGET_LATENCY', v+'s'),
+    'FAST': v=> kv('FAST', v),
+    'ENABLE_METRICS': v=> kv('ENABLE_METRICS', v, v==='1'?'ok':'warn'),
+  };
+  // 优先显示关键参数
+  const priority=['STEP','MODEL_TYPE','GPU_IDS','USE_TAEHV','USE_TENSORRT','SCHEDULE_BLOCK','STREAMV2V_LOCK_RUNTIME_FLAGS','TARGET_LATENCY','FAST','ENABLE_METRICS'];
+  let html='';
+  for(const k of priority){
+    if(cfg[k]!==undefined){
+      html += (highlights[k] || (v=>kv(k,v)))(cfg[k]);
+    }
+  }
+  // 其余参数
+  const rest=Object.keys(cfg).filter(k=>!priority.includes(k)).sort();
+  for(const k of rest){
+    html += kv(k, cfg[k].length>60 ? cfg[k].slice(0,60)+'…' : cfg[k]);
+  }
+  el.innerHTML=html;
+}
 
 function renderThroughput(t){
   const el=document.getElementById('throughput');
@@ -724,6 +852,85 @@ function renderLatency(m){
   histBody.innerHTML=rows;
 }
 
+// ── 18-stage pipeline breakdown ──
+const STAGE_LABELS = {
+  s01_camera_capture_ms:    '① Camera capture (getUserMedia)',
+  s02_jpeg_encode_ms:       '② JPEG encode (canvas.toBlob)',
+  s03_ws_recv_decode_ms:    '③ WS recv + JPEG decode + throttle',
+  s04_update_data_ms:       '④ update_data (param merge)',
+  s05_push_pipeline_ms:     '⑤ accept_new_params (push to pipeline)',
+  s06_input_queue_wait_ms:  '⑥ input_queue wait (included in ⑦)',
+  s07_read_queue_ms:        '⑦ read_images_from_queue (GPU side)',
+  s08_vae_encode_ms:        '⑧ VAE encode (rank 0)',
+  s09_dit_rank0_ms:         '⑨ DiT rank 0',
+  s10_nccl_send_ms:         '⑩ NCCL send_latent_data',
+  s11_dit_last_rank_ms:     '⑪ DiT last rank',
+  s12_vae_decode_ms:        '⑫ VAE decode (last rank)',
+  s13_output_queue_put_ms:  '⑬ output_queue.put',
+  s14_produce_outputs_ms:   '⑭ produce_outputs (main thread)',
+  s15_pil_to_frame_ms:      '⑮ pil_to_frame (JPEG encode)',
+  s16_output_yield_ms:      '⑯ output_queue → MJPEG yield',
+  s17_http_chunked_ms:      '⑰ HTTP chunked transfer',
+  s18_frontend_decode_ms:   '⑱ Frontend decode + render',
+};
+const STAGE_ORDER = Object.keys(STAGE_LABELS);
+
+function renderStages(sm) {
+  const summary = document.getElementById('stagesummary');
+  const tbody = document.querySelector('#stagetab tbody');
+  if (!sm || sm.status !== 'ok') {
+    const reason = (sm && sm.reason) || (sm && sm.status) || 'unavailable';
+    summary.innerHTML = `<small class="warn">stage metrics: ${reason}</small>`;
+    tbody.innerHTML = '';
+    return;
+  }
+  const d = sm.data || {};
+  const avgs = d.averages || {};
+  const ta = d.total_avg || {};
+  // Summary line
+  summary.innerHTML =
+    `<div class="row">
+       <span>samples: <b>${d.samples||0}</b></span>
+       <span>measured total: <b class="ok">${ta.measured_ms!=null?ta.measured_ms.toFixed(1)+' ms':'-'}</b></span>
+       <span>estimated total: <b class="warn">${ta.estimated_ms!=null?ta.estimated_ms.toFixed(1)+' ms':'-'}</b> <small>(估算)</small></span>
+       <span>grand total: <b>${ta.total_ms!=null?ta.total_ms.toFixed(1)+' ms':'-'}</b></span>
+     </div>`;
+
+  // Find max mean for bar scaling
+  let maxMean = 1;
+  for (const sk of STAGE_ORDER) {
+    const a = avgs[sk];
+    if (a && a.mean_ms != null && a.mean_ms > maxMean) maxMean = a.mean_ms;
+  }
+
+  let rows = '';
+  for (let i = 0; i < STAGE_ORDER.length; i++) {
+    const sk = STAGE_ORDER[i];
+    const label = STAGE_LABELS[sk];
+    const a = avgs[sk] || {};
+    const stype = a.type || 'measured';
+    const isEst = stype === 'estimated';
+    const typeTag = isEst
+      ? '<span class="warn">估算</span>'
+      : (stype === 'gpu_measured' ? '<span class="ok">GPU</span>' : '<span class="ok">精确</span>');
+    const mean = a.mean_ms != null ? a.mean_ms.toFixed(2) + ' ms' : '-';
+    const mn = a.min_ms != null ? a.min_ms.toFixed(2) : '-';
+    const mx = a.max_ms != null ? a.max_ms.toFixed(2) : '-';
+    const w = a.mean_ms != null ? Math.round(a.mean_ms / maxMean * 100) : 0;
+    const barCls = isEst ? 'warn' : (a.mean_ms != null && a.mean_ms > 50 ? 'warn' : '');
+    rows += `<tr${isEst?' style="opacity:0.7"':''}>
+      <td>${i+1}</td>
+      <td>${label}</td>
+      <td>${typeTag}</td>
+      <td>${mean}</td>
+      <td>${mn}</td>
+      <td>${mx}</td>
+      <td><span class="bar" style="width:95%"><i class="${barCls}" style="width:${w}%"></i></span></td>
+    </tr>`;
+  }
+  tbody.innerHTML = rows;
+}
+
 refresh();setInterval(refresh,5000);
 </script>
 </body></html>"""
@@ -746,11 +953,38 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _send_file_download(self, filepath, filename=None):
+        """Serve a file as a download attachment."""
+        if not os.path.isfile(filepath):
+            self._send(404, {"error": "file not found"})
+            return
+        with open(filepath, "rb") as f:
+            data = f.read()
+        dl_name = filename or os.path.basename(filepath)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{dl_name}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         try:
             if path == "/" or path == "/index.html":
                 self._send(200, HTML, "text/html")
+            elif path.startswith("/download/"):
+                # Serve files from the same directory as monitor.py
+                fname = path[len("/download/"):]
+                # Security: only allow simple filenames, no path traversal
+                if "/" in fname or "\\" in fname or ".." in fname:
+                    self._send(403, {"error": "forbidden"})
+                    return
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                filepath = os.path.join(base_dir, fname)
+                self._send_file_download(filepath)
             elif path == "/api/status":
                 snap = LAST_STATE["snapshot"] or take_snapshot()
                 self._send(200, snap)
@@ -761,6 +995,27 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, list(RESTART_EVENTS))
             elif path == "/api/history":
                 self._send(200, list(HISTORY))
+            elif path.startswith("/download/"):
+                fname = path.split("/download/", 1)[1]
+                # 安全：只允许下载同目录下的 .md 文件
+                if ".." in fname or "/" in fname or not fname.endswith(".md"):
+                    self._send(403, {"error": "forbidden"})
+                    return
+                fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+                if not os.path.isfile(fpath):
+                    self._send(404, {"error": f"file not found: {fname}"})
+                    return
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                b = content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Content-Length", str(len(b)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(b)
             elif path == "/healthz":
                 snap = LAST_STATE["snapshot"]
                 if snap and snap.get("status") in ("GREEN", "YELLOW"):
