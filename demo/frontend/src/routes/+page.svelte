@@ -8,6 +8,7 @@
   import PipelineOptions from '$lib/components/PipelineOptions.svelte';
   import Spinner from '$lib/icons/spinner.svelte';
   import Warning from '$lib/components/Warning.svelte';
+  import ModelSelector from '$lib/components/ModelSelector.svelte';
   import { lcmLiveStatus, lcmLiveActions, LCMLiveStatus, streamId } from '$lib/lcmLive';
   import { mediaStreamActions, onFrameChangeStore } from '$lib/mediaStream';
   import { getPipelineValues, deboucedPipelineValues } from '$lib/store';
@@ -157,6 +158,7 @@
 
 <main class="container mx-auto flex max-w-5xl flex-col gap-3 px-4 py-4">
   <Warning bind:message={warningMessage}></Warning>
+  <ModelSelector />
   <article class="text-center">
     {#if pageContent}
       {@html pageContent}
